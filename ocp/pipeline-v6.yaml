@@ -1,0 +1,126 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: s2i-build-commit-sync
+spec:
+  params:
+    - default: ocp-fastapi-quickstart-project
+      name: PROJECT_NAMESPACE
+      type: string
+    - default: fastapi-quickstart-app
+      name: IMAGE_NAME
+      type: string
+    - default: '1.6'
+      name: IMAGE_TAG
+      type: string
+    - default: 'https://github.com/commandlineguru/fastapi-quickstart-project.git'
+      name: GIT_REPO
+      type: string
+    - default: main
+      name: GIT_REVISION
+      type: string
+    - default: Hello from Pipeline v6
+      name: MESSAGE
+      type: string
+  workspaces:
+    - name: workspace
+    - name: ssh-workspace
+  tasks:
+    - name: fetch-repository
+      taskRef:
+        name: git-clone
+        kind: ClusterTask
+      workspaces:
+        - name: output
+          workspace: workspace
+      params:
+        - name: url
+          value: $(params.GIT_REPO)
+        - name: revision
+          value: $(params.GIT_REVISION)
+        - name: subdirectory
+          value: ""
+        - name: deleteExisting
+          value: "true"
+    - name: build
+      taskRef:
+        name: s2i-python
+        kind: ClusterTask
+      runAfter:
+        - fetch-repository
+      workspaces:
+        - name: source
+          workspace: workspace
+      params:
+        - name: IMAGE
+          value: image-registry.openshift-image-registry.svc:5000/$(params.PROJECT_NAMESPACE)/$(params.IMAGE_NAME):$(params.IMAGE_TAG)
+        - name: TLSVERIFY
+          value: "false"
+    - name: yq
+      params:
+        - name: files
+          value:
+            - helm/values.yaml
+        - name: expression
+          value: .tag = $(params.IMAGE_TAG)
+        - name: image
+          value: >-
+            docker.io/mikefarah/yq:4.16.2@sha256:0d4f6e27bdcac7316f635acd524ab0eecc4ad50834b54d10322268650c7712cb
+      runAfter:
+        - build
+      taskRef:
+        kind: Task
+        name: yq
+      workspaces:
+        - name: source
+          workspace: workspace
+    - name: git-commit-push
+      params:
+        - name: BASE_IMAGE
+          value: >-
+            docker.io/alpine/git:v2.26.2@sha256:23618034b0be9205d9cc0846eb711b12ba4c9b468efdd8a59aac1d7b1a23363f
+        - name: GIT_SCRIPT
+          value: >
+            git add helm/values.yaml
+
+            git commit -m "updated tag via pipeline"
+
+            git remote set-url origin git@github.com:commandlineguru/fastapi-quickstart-project.git
+
+            export GIT_SSH_COMMAND="ssh -i /root/.ssh/id_rsa -o 'IdentitiesOnly yes'"
+
+            git push origin HEAD:$(params.GIT_REVISION)
+        - name: USER_HOME
+          value: /root
+        - name: VERBOSE
+          value: 'true'
+        - name: GIT_USER_NAME
+          value: rwalker-redhat
+        - name: GIT_USER_EMAIL
+          value: rwalker@redhat.com
+      runAfter:
+        - yq
+      taskRef:
+        kind: ClusterTask
+        name: git-cli
+      workspaces:
+        - name: source
+          workspace: workspace
+        - name: ssh-directory
+          workspace: ssh-workspace
+    - name: argocd-sync-and-wait
+      params:
+        - name: application-name
+          value: fastapi-quickstart-app
+        - name: revision
+          value: main
+        - name: flags
+          value: '--'
+        - name: argocd-version
+          value: v2.1.6
+      runAfter:
+        - git-commit-push
+      taskRef:
+        kind: Task
+        name: argocd-task-sync-and-wait
+
